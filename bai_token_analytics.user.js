@@ -1,11 +1,14 @@
 // ==UserScript==
 // @name         BAI Token 用量多维度聚合统计
 // @namespace    https://chat.b.ai/
-// @version      1.0.0
-// @description  自动翻页抓取并统计 chat.b.ai 的今天、本周、最近24小时、最近7天中各模型 Token 用量（输入/输出/合计/调用次数），支持图表可视化与数据导出。
+// @version      1.1.0
+// @description  自动抓取并统计 chat.b.ai 的今天、本周、最近24小时、最近7天中各模型 Token 用量（输入/输出/合计/调用次数），支持本地持久化存储、智能增量同步、图表可视化与数据导出。
 // @author       Antigravity
 // @match        https://chat.b.ai/*
 // @grant        GM_registerMenuCommand
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
 // @run-at       document-end
 // ==/UserScript==
 
@@ -61,7 +64,7 @@
       pointer-events: auto;
     }
     #bai-stat-modal {
-      width: 900px;
+      width: 920px;
       max-width: 94vw;
       max-height: 90vh;
       background: #ffffff;
@@ -95,12 +98,17 @@
     }
     .bai-stat-badge {
       font-size: 12px;
-      font-weight: normal;
+      font-weight: 500;
       background: #e6f4ff;
       color: #0958d9;
       padding: 2px 8px;
       border-radius: 12px;
       border: 1px solid #91caff;
+    }
+    .bai-stat-badge.badge-cached {
+      background: #f6ffed;
+      color: #389e0d;
+      border-color: #b7eb8f;
     }
     .bai-stat-close-btn {
       background: none;
@@ -252,24 +260,31 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
     }
     .bai-stat-meta-text {
       font-size: 12px;
       color: #8c8c8c;
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
     .bai-stat-actions {
       display: flex;
-      gap: 10px;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
     }
     .bai-stat-btn {
-      padding: 8px 16px;
+      padding: 7px 14px;
       border-radius: 8px;
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 500;
       cursor: pointer;
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 5px;
       transition: all 0.2s;
     }
     .bai-stat-btn-secondary {
@@ -280,6 +295,16 @@
     .bai-stat-btn-secondary:hover {
       border-color: #1677ff;
       color: #1677ff;
+    }
+    .bai-stat-btn-danger {
+      background: #fff;
+      border: 1px solid #ffa39e;
+      color: #cf1322;
+    }
+    .bai-stat-btn-danger:hover {
+      background: #fff1f0;
+      border-color: #ff4d4f;
+      color: #a8071a;
     }
     .bai-stat-btn-primary {
       background: #1677ff;
@@ -327,13 +352,82 @@
   // --- Constants ---
   const MODEL_COLORS = ['#1677ff', '#52c41a', '#fa8c16', '#722ed1', '#eb2f96', '#faad14'];
 
+  // --- Persistent Storage Manager ---
+  const Storage = {
+    KEYS: {
+      RECORDS: 'bai_usage_records_v1',
+      LAST_SYNC: 'bai_last_sync_time_v1',
+    },
+    get(key, defaultValue = null) {
+      try {
+        if (typeof GM_getValue !== 'undefined') {
+          const val = GM_getValue(key, null);
+          return val !== null ? val : defaultValue;
+        }
+        const val = localStorage.getItem(key);
+        return val ? JSON.parse(val) : defaultValue;
+      } catch (e) {
+        console.warn('[BAI Analytics] Storage.get error:', e);
+        return defaultValue;
+      }
+    },
+    set(key, value) {
+      try {
+        if (typeof GM_setValue !== 'undefined') {
+          GM_setValue(key, value);
+          return;
+        }
+        localStorage.setItem(key, JSON.stringify(value));
+      } catch (e) {
+        console.warn('[BAI Analytics] Storage.set error:', e);
+      }
+    },
+    remove(key) {
+      try {
+        if (typeof GM_deleteValue !== 'undefined') {
+          GM_deleteValue(key);
+          return;
+        }
+        localStorage.removeItem(key);
+      } catch (e) {
+        console.warn('[BAI Analytics] Storage.remove error:', e);
+      }
+    },
+    clear() {
+      this.remove(this.KEYS.RECORDS);
+      this.remove(this.KEYS.LAST_SYNC);
+    }
+  };
+
+  // --- Deduplication & Merge Helper ---
+  function getRecordKey(item) {
+    if (item.id) return String(item.id);
+    return `${item.created_at}_${item.model}_${item.input_tokens}_${item.output_tokens}_${item.cost_points || 0}`;
+  }
+
+  function mergeRecords(newRecords, oldRecords) {
+    const map = new Map();
+    // 优先放入新抓取的记录，再放入老记录
+    for (const r of [...newRecords, ...oldRecords]) {
+      const key = getRecordKey(r);
+      if (!map.has(key)) {
+        map.set(key, r);
+      }
+    }
+    // 统一按 created_at 降序（最新在前）
+    return Array.from(map.values()).sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  }
+
   // --- State ---
+  const initialRecords = Storage.get(Storage.KEYS.RECORDS, []) || [];
+  const initialLastSync = Storage.get(Storage.KEYS.LAST_SYNC, null);
+
   let state = {
-    allRecords: [],
-    cachedStats: null,
+    allRecords: initialRecords,
+    cachedStats: initialRecords.length > 0 ? calculateStats(initialRecords) : null,
     loading: false,
     activeTab: 'today', // today | thisWeek | last24h | last7d
-    lastFetchTime: null,
+    lastSyncTime: initialLastSync ? new Date(initialLastSync) : null,
   };
 
   // --- Helper Date Calculations ---
@@ -416,14 +510,18 @@
     return result;
   }
 
-  // --- Fetch API with automatic pagination ---
-  async function fetchAllUsageRecords(onProgress) {
-    const records = [];
+  // --- Fetch & Synchronize API with Smart Incremental Support ---
+  async function syncUsageRecords(isFullSync = false, onProgress) {
+    const existingRecords = isFullSync ? [] : (Storage.get(Storage.KEYS.RECORDS, []) || []);
+    const existingKeySet = new Set(existingRecords.map(getRecordKey));
+
+    const fetchedNewRecords = [];
     let page = 1;
     let cursor = undefined;
     const now = Date.now();
-    const maxTimeLimit = now - 8 * 24 * 60 * 60 * 1000; // Stop beyond 8 days
+    const maxTimeLimit = now - 30 * 24 * 60 * 60 * 1000; // 最多回溯30天
     const MAX_RETRIES = 3;
+    let hitExisting = false;
 
     while (page <= 500) {
       const inputObj = {
@@ -453,12 +551,22 @@
           const waitMs = 500 * Math.pow(2, attempt);
           await new Promise(r => setTimeout(r, waitMs));
         } else {
-          // 4xx 非限流错误，停止并返回已有数据
-          return { records, error: new Error(`请求第 ${page} 页失败: HTTP ${res.status}`) };
+          // 4xx 错误中断并保留已有合并数据
+          const merged = mergeRecords(fetchedNewRecords, existingRecords);
+          return {
+            records: merged,
+            newCount: fetchedNewRecords.length,
+            error: new Error(`请求第 ${page} 页失败: HTTP ${res.status}`)
+          };
         }
       }
       if (lastErr) {
-        return { records, error: new Error(`请求第 ${page} 页失败（已重试 ${MAX_RETRIES} 次）: ${lastErr.message}`) };
+        const merged = mergeRecords(fetchedNewRecords, existingRecords);
+        return {
+          records: merged,
+          newCount: fetchedNewRecords.length,
+          error: new Error(`请求第 ${page} 页失败（已重试 ${MAX_RETRIES} 次）: ${lastErr.message}`)
+        };
       }
 
       const json = await res.json();
@@ -466,17 +574,30 @@
       if (!resultObj || !Array.isArray(resultObj.data)) break;
 
       const pageData = resultObj.data;
-      records.push(...pageData);
+      if (pageData.length === 0) break;
+
+      for (const item of pageData) {
+        const key = getRecordKey(item);
+        if (!isFullSync && existingKeySet.has(key)) {
+          // 增量模式下，一旦遇到本地已存在的记录，说明更早的历史数据本地均已有，直接结束翻页
+          hitExisting = true;
+          break;
+        }
+        fetchedNewRecords.push(item);
+        existingKeySet.add(key);
+      }
 
       if (onProgress) {
-        onProgress(page, records.length);
+        onProgress(page, fetchedNewRecords.length, isFullSync);
       }
 
-      // 检查最旧记录是否超出时间范围
-      if (pageData.length > 0) {
-        const oldestTime = new Date(pageData[pageData.length - 1].created_at).getTime();
-        if (oldestTime < maxTimeLimit) break;
+      if (hitExisting) {
+        break;
       }
+
+      // 检查最旧记录是否超出时间限制
+      const oldestTime = new Date(pageData[pageData.length - 1].created_at).getTime();
+      if (oldestTime < maxTimeLimit) break;
 
       // 以 has_more 为唯一翻页依据
       if (!resultObj.has_more) break;
@@ -486,7 +607,24 @@
       await new Promise(r => setTimeout(r, 60));
     }
 
-    return { records, error: null };
+    const merged = mergeRecords(fetchedNewRecords, existingRecords);
+
+    // 持久化存储
+    Storage.set(Storage.KEYS.RECORDS, merged);
+    Storage.set(Storage.KEYS.LAST_SYNC, Date.now());
+
+    return {
+      records: merged,
+      newCount: fetchedNewRecords.length,
+      error: null
+    };
+  }
+
+  function formatTime(date) {
+    if (!date) return '从未同步';
+    const d = new Date(date);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   }
 
   // --- Render UI ---
@@ -515,7 +653,9 @@
               <path d="m19 9-5 5-4-4-3 3"/>
             </svg>
             Token 用量多维度聚合分析
-            <span class="bai-stat-badge">实时统计</span>
+            <span class="bai-stat-badge ${state.allRecords.length > 0 ? 'badge-cached' : ''}" id="bai-stat-badge">
+              ${state.allRecords.length > 0 ? '本地已缓存' : '实时统计'}
+            </span>
           </div>
           <button class="bai-stat-close-btn" id="bai-stat-close">&times;</button>
         </div>
@@ -534,11 +674,17 @@
         </div>
 
         <div class="bai-stat-footer">
-          <div class="bai-stat-meta-text" id="bai-stat-meta">已抓取 0 条记录</div>
+          <div class="bai-stat-meta-text" id="bai-stat-meta">
+            ${state.allRecords.length > 0 
+              ? `已缓存 ${state.allRecords.length} 条记录 | 上次同步: ${formatTime(state.lastSyncTime)}` 
+              : '本地暂无缓存，点击增量同步拉取最新记录'}
+          </div>
           <div class="bai-stat-actions">
+            <button class="bai-stat-btn bai-stat-btn-danger" id="bai-stat-clear" title="清空本地所有已缓存的记录">🗑️ 清空</button>
+            <button class="bai-stat-btn bai-stat-btn-secondary" id="bai-stat-full-refresh" title="清除缓存并从头重新抓取全部历史">⚡ 全量重抓</button>
             <button class="bai-stat-btn bai-stat-btn-secondary" id="bai-stat-export-csv">📥 导出 CSV</button>
             <button class="bai-stat-btn bai-stat-btn-secondary" id="bai-stat-export-json">📦 导出 JSON</button>
-            <button class="bai-stat-btn bai-stat-btn-primary" id="bai-stat-refresh">🔄 重新抓取</button>
+            <button class="bai-stat-btn bai-stat-btn-primary" id="bai-stat-sync">🔄 增量同步</button>
           </div>
         </div>
       </div>
@@ -549,7 +695,7 @@
     triggerBtn.addEventListener('click', () => {
       overlay.classList.add('active');
       if (state.allRecords.length === 0 && !state.loading) {
-        startFetch();
+        startSync(true);
       } else {
         renderContent();
       }
@@ -572,8 +718,37 @@
       });
     });
 
-    overlay.querySelector('#bai-stat-refresh').addEventListener('click', () => {
-      startFetch();
+    // 增量同步按钮
+    overlay.querySelector('#bai-stat-sync').addEventListener('click', () => {
+      startSync(false);
+    });
+
+    // 全量重抓按钮
+    overlay.querySelector('#bai-stat-full-refresh').addEventListener('click', () => {
+      if (state.allRecords.length > 0) {
+        if (!confirm('确定要清除本地缓存并重新全量抓取所有历史用量吗？（这可能需要翻页数次）')) {
+          return;
+        }
+      }
+      startSync(true);
+    });
+
+    // 清空缓存按钮
+    overlay.querySelector('#bai-stat-clear').addEventListener('click', () => {
+      if (confirm('确定要清空本地已持久化存储的所有 Token 用量记录吗？')) {
+        Storage.clear();
+        state.allRecords = [];
+        state.cachedStats = null;
+        state.lastSyncTime = null;
+        const metaText = document.querySelector('#bai-stat-meta');
+        if (metaText) metaText.innerText = '本地缓存已清空';
+        const badge = document.querySelector('#bai-stat-badge');
+        if (badge) {
+          badge.className = 'bai-stat-badge';
+          badge.innerText = '实时统计';
+        }
+        renderContent();
+      }
     });
 
     overlay.querySelector('#bai-stat-export-csv').addEventListener('click', () => {
@@ -585,38 +760,69 @@
     });
   }
 
-  async function startFetch() {
+  async function startSync(isFullSync = false) {
+    if (state.loading) return;
     state.loading = true;
+
     const loadingBar = document.querySelector('#bai-stat-loading-bar');
-    const refreshBtn = document.querySelector('#bai-stat-refresh');
+    const syncBtn = document.querySelector('#bai-stat-sync');
+    const fullBtn = document.querySelector('#bai-stat-full-refresh');
+    const clearBtn = document.querySelector('#bai-stat-clear');
     const metaText = document.querySelector('#bai-stat-meta');
+    const badge = document.querySelector('#bai-stat-badge');
     
     if (loadingBar) loadingBar.classList.add('active');
-    if (refreshBtn) refreshBtn.disabled = true;
-    if (metaText) metaText.innerText = '正在自动翻页抓取全部记录...';
+    if (syncBtn) syncBtn.disabled = true;
+    if (fullBtn) fullBtn.disabled = true;
+    if (clearBtn) clearBtn.disabled = true;
+
+    if (metaText) {
+      metaText.innerText = isFullSync ? '正在执行全量抓取...' : '正在检查最新用量记录并增量同步...';
+    }
 
     try {
-      const { records, error } = await fetchAllUsageRecords((page, count) => {
-        if (metaText) metaText.innerText = `正在抓取第 ${page} 页，已获取 ${count} 条明细...`;
+      const { records, newCount, error } = await syncUsageRecords(isFullSync, (page, count, isFull) => {
+        if (metaText) {
+          metaText.innerText = isFull 
+            ? `正在全量抓取第 ${page} 页，已获取 ${count} 条明细...` 
+            : `正在增量同步第 ${page} 页，发现 ${count} 条新记录...`;
+        }
       });
+
       state.allRecords = records;
       state.cachedStats = calculateStats(records);
-      state.lastFetchTime = new Date();
+      state.lastSyncTime = new Date();
+
+      if (badge) {
+        badge.className = 'bai-stat-badge badge-cached';
+        badge.innerText = `已缓存 (${records.length} 条)`;
+      }
+
       if (error) {
-        console.warn('抓取中断:', error);
-        if (metaText) metaText.innerText = `抓取中断 (${error.message})，已保留 ${records.length} 条记录`;
+        console.warn('[BAI Analytics] 同步中断:', error);
+        if (metaText) {
+          metaText.innerText = `同步中断 (${error.message})，本地已保存 ${records.length} 条记录 (${formatTime(state.lastSyncTime)})`;
+        }
       } else {
         if (metaText) {
-          metaText.innerText = `抓取完成！共计 ${records.length} 条记录 (${state.lastFetchTime.toLocaleTimeString()})`;
+          if (isFullSync) {
+            metaText.innerText = `全量抓取完成！共计 ${records.length} 条记录 (${formatTime(state.lastSyncTime)})`;
+          } else {
+            metaText.innerText = newCount > 0 
+              ? `增量同步完成！新增 ${newCount} 条记录，当前共 ${records.length} 条 (${formatTime(state.lastSyncTime)})`
+              : `已是最新数据（无新增调用），本地共 ${records.length} 条记录 (${formatTime(state.lastSyncTime)})`;
+          }
         }
       }
     } catch (err) {
-      console.error('抓取失败:', err);
-      if (metaText) metaText.innerText = `抓取失败: ${err.message}`;
+      console.error('[BAI Analytics] 同步失败:', err);
+      if (metaText) metaText.innerText = `同步失败: ${err.message}`;
     } finally {
       state.loading = false;
       if (loadingBar) loadingBar.classList.remove('active');
-      if (refreshBtn) refreshBtn.disabled = false;
+      if (syncBtn) syncBtn.disabled = false;
+      if (fullBtn) fullBtn.disabled = false;
+      if (clearBtn) clearBtn.disabled = false;
       renderContent();
     }
   }
@@ -629,7 +835,7 @@
       container.innerHTML = `
         <div style="text-align:center; padding: 40px; color: #8c8c8c;">
           <div style="font-size: 28px; margin-bottom: 12px;">⏳</div>
-          <div style="font-size: 14px; font-weight: 500;">正在从官方接口自动翻页抓取每次调用用量...</div>
+          <div style="font-size: 14px; font-weight: 500;">正在从官方接口抓取用量记录并建立本地缓存...</div>
         </div>
       `;
       return;
@@ -639,7 +845,7 @@
       container.innerHTML = `
         <div style="text-align:center; padding: 40px; color: #8c8c8c;">
           <div style="font-size: 28px; margin-bottom: 12px;">📭</div>
-          <div style="font-size: 14px; font-weight: 500;">暂无用量记录，点击下方“重新抓取”开始分析。</div>
+          <div style="font-size: 14px; font-weight: 500;">暂无用量缓存，点击下方“增量同步”或“全量重抓”开始分析。</div>
         </div>
       `;
       return;
@@ -746,7 +952,7 @@
 
   function exportData(format) {
     if (state.allRecords.length === 0) {
-      alert('暂无数据可导出，请先点击重新抓取');
+      alert('暂无数据可导出，请先点击增量同步或全量重抓');
       return;
     }
     const allStats = state.cachedStats || calculateStats(state.allRecords);
