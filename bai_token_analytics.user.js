@@ -483,32 +483,50 @@
     .bai-stat-table-wrapper {
       border: 1px solid #f0f0f0;
       border-radius: 10px;
-      overflow-x: auto;
       background: #fff;
+      position: relative;
     }
     .bai-stat-table {
       width: 100%;
-      border-collapse: collapse;
+      border-collapse: separate;
+      border-spacing: 0;
       text-align: left;
       font-size: 12px;
       min-width: 900px;
     }
     .bai-stat-table th {
+      position: sticky;
+      top: -18px;
+      z-index: 10;
       background: #fafafa;
       padding: 10px 12px;
       color: #595959;
       font-weight: 600;
-      border-bottom: 1px solid #f0f0f0;
+      border-bottom: 1px solid #e8e8e8;
       white-space: nowrap;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+    }
+    .bai-stat-table thead tr th:first-child {
+      border-top-left-radius: 9px;
+    }
+    .bai-stat-table thead tr th:last-child {
+      border-top-right-radius: 9px;
     }
     .bai-stat-table td {
       padding: 10px 12px;
       border-bottom: 1px solid #f5f5f5;
       color: #262626;
       vertical-align: middle;
+      background: #fff;
     }
     .bai-stat-table tr:last-child td {
       border-bottom: none;
+    }
+    .bai-stat-table tr:last-child td:first-child {
+      border-bottom-left-radius: 9px;
+    }
+    .bai-stat-table tr:last-child td:last-child {
+      border-bottom-right-radius: 9px;
     }
     .bai-stat-table tr:hover td {
       background: #fafafa;
