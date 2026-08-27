@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# MCP / Playwright dev tool runtime artifacts
+.playwright-mcp/
+
+# Logs
+*.log
+logs/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Environment
+.env
+.env.local

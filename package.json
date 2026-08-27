@@ -1,0 +1,29 @@
+{
+  "name": "bai-token-analytics",
+  "version": "1.0.0",
+  "description": "Tampermonkey userscript for multi-dimensional Token usage analytics on chat.b.ai",
+  "main": "install_server.js",
+  "scripts": {
+    "start": "node install_server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "tampermonkey",
+    "userscript",
+    "greasemonkey",
+    "token",
+    "analytics",
+    "chat.b.ai",
+    "bai",
+    "usage"
+  ],
+  "author": "Antigravity",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "eventsource": "^5.1.1",
+    "playwright-core": "^1.62.1",
+    "ws": "^8.21.3"
+  }
+}
