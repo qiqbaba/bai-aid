@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BAI Token 用量多维度聚合统计
 // @namespace    https://chat.b.ai/
-// @version      1.3.1
+// @version      1.4.0
 // @description  自动抓取并统计 chat.b.ai 的今天、本周、最近24小时、最近7天及全历史各模型 Token 用量（输入/输出/合计/缓存命中/缓存创建/耗时/TPS/联网搜索/调用次数），支持全局多维与自定义日期时间筛选、默认隐藏/折叠筛选栏、本地持久化存储、智能增量同步、图表可视化与完整数据导出。
 // @author       Antigravity
 // @match        https://chat.b.ai/*
@@ -744,7 +744,9 @@
   // --- Deduplication & Merge Helper ---
   function getRecordKey(item) {
     if (item.id) return String(item.id);
-    return `${item.created_at}_${item.model}_${item.input_tokens}_${item.output_tokens}_${item.cost_points || 0}`;
+    if (item.request_id) return `req_${item.request_id}`;
+    // 兜底 key 尽量带上所有可区分字段，降低同秒同参数调用撞键的概率
+    return `${item.created_at}_${item.model}_${item.input_tokens}_${item.output_tokens}_${item.cost_points || 0}_${item.duration_ms || item.duration_sec || 0}_${item.web_search_count || 0}`;
   }
 
   function mergeRecords(newRecords, oldRecords) {
@@ -1017,28 +1019,42 @@
     const existingRecords = isFullSync ? [] : (Storage.get(Storage.KEYS.RECORDS, []) || []);
     const existingKeySet = new Set(existingRecords.map(getRecordKey));
 
+    // 本地已有记录中的最新时间戳（用于时间缓冲判定，容忍服务端排序抖动/迟到数据）
+    let localLatestMs = 0;
+    if (!isFullSync) {
+      for (const r of existingRecords) {
+        const t = new Date(r.created_at).getTime();
+        if (!isNaN(t) && t > localLatestMs) localLatestMs = t;
+      }
+    }
+    // 时间缓冲：只有整页记录都明显老于本地最新记录一定时间，才确认没有遗漏
+    const STOP_BUFFER_MS = 5 * 60 * 1000;
+
     const fetchedNewRecords = [];
     let page = 1;
     let cursor = undefined;
+    let fetchCount = 0; // 实际抓取页数计数（游标模式下 page 不递增，需要独立计数兜底）
     const now = Date.now();
-    const maxTimeLimit = now - 30 * 24 * 60 * 60 * 1000; // 最多回溯30天
+    const maxTimeLimit = now - 30 * 24 * 60 * 60 * 1000; // 增量同步最多回溯30天（全量不限制）
     const MAX_RETRIES = 3;
-    let hitExisting = false;
+    // 页数硬上限仅作安全兜底：全量 5000 页（50万条），增量 500 页
+    const maxPages = isFullSync ? 5000 : 500;
 
-    while (page <= 500) {
-      const inputObj = {
-        "0": {
-          "json": {
-            "page": page,
-            "pageSize": 100,
-            "sortBy": "created_at",
-            "sortOrder": "desc"
-          }
-        }
+    while (fetchCount < maxPages) {
+      fetchCount++;
+      const jsonPayload = {
+        "pageSize": 100,
+        "sortBy": "created_at",
+        "sortOrder": "desc"
       };
       if (cursor) {
-        inputObj["0"].json.cursor = cursor;
+        // 游标分页：只传游标，避免 page 偏移在新数据写入时错位漏数据
+        jsonPayload.cursor = cursor;
+      } else {
+        // 无游标时退化为页码分页
+        jsonPayload.page = page;
       }
+      const inputObj = { "0": { "json": jsonPayload } };
 
       const url = `/trpc/lambda/usage.records?batch=1&input=${encodeURIComponent(JSON.stringify(inputObj))}`;
 
@@ -1057,7 +1073,7 @@
           return {
             records: merged,
             newCount: fetchedNewRecords.length,
-            error: new Error(`请求第 ${page} 页失败: HTTP ${res.status}`)
+            error: new Error(`请求第 ${fetchCount} 页失败: HTTP ${res.status}`)
           };
         }
       }
@@ -1066,7 +1082,7 @@
         return {
           records: merged,
           newCount: fetchedNewRecords.length,
-          error: new Error(`请求第 ${page} 页失败（已重试 ${MAX_RETRIES} 次）: ${lastErr.message}`)
+          error: new Error(`请求第 ${fetchCount} 页失败（已重试 ${MAX_RETRIES} 次）: ${lastErr.message}`)
         };
       }
 
@@ -1077,31 +1093,49 @@
       const pageData = resultObj.data;
       if (pageData.length === 0) break;
 
+      // 扫描整页：即使中途命中已存在记录也不立刻停，抓完整页以容忍排序抖动和迟到数据
+      let hitExistingOnThisPage = false;
       for (const item of pageData) {
         const key = getRecordKey(item);
         if (!isFullSync && existingKeySet.has(key)) {
-          hitExisting = true;
-          break;
+          hitExistingOnThisPage = true;
+          continue;
         }
         fetchedNewRecords.push(item);
         existingKeySet.add(key);
       }
 
       if (onProgress) {
-        onProgress(page, fetchedNewRecords.length, isFullSync);
-      }
-
-      if (hitExisting) {
-        break;
+        onProgress(fetchCount, fetchedNewRecords.length, isFullSync);
       }
 
       const oldestTime = new Date(pageData[pageData.length - 1].created_at).getTime();
-      if (oldestTime < maxTimeLimit) break;
+
+      if (!isFullSync) {
+        // 增量同步停止条件（需同时满足，双重保险）：
+        // 1. 本页命中过已存在记录，说明已与本地数据衔接；
+        // 2. 本页最老记录已早于"本地最新记录 - 缓冲时间"，说明再往前不可能有遗漏。
+        if (hitExistingOnThisPage && oldestTime < localLatestMs - STOP_BUFFER_MS) {
+          break;
+        }
+        // 兜底：本地无记录（首次同步）时按时间窗停止
+        if (localLatestMs === 0 && oldestTime < maxTimeLimit) break;
+      }
+      // 全量同步：不命中任何提前终止条件，一直抓到 has_more 为 false
 
       if (!resultObj.has_more) break;
-      cursor = resultObj.next_cursor;
 
-      page++;
+      const nextCursor = resultObj.next_cursor;
+      if (nextCursor) {
+        cursor = nextCursor;
+      } else if (!cursor) {
+        // 服务端不提供游标时才使用页码递增
+        page++;
+      } else {
+        // 有游标模式但没有返回 next_cursor，无法继续，停止
+        break;
+      }
+
       await new Promise(r => setTimeout(r, 60));
     }
 
